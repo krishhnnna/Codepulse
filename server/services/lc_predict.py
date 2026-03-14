@@ -14,8 +14,8 @@ Flow:
 Caches standings + ratings per contest so repeated queries are instant.
 """
 
-import httpx
 import asyncio
+from curl_cffi import requests
 import math
 import time
 import json
@@ -75,9 +75,7 @@ async def get_prediction(handle: str) -> Optional[dict]:
     log = logging.getLogger("lc_predict")
     log.info(f"[LC-PREDICT] Starting prediction for {handle}")
 
-    async with httpx.AsyncClient(
-        timeout=120, follow_redirects=True, headers=REST_HEADERS
-    ) as client:
+    async with requests.AsyncSession(impersonate="chrome120", timeout=120) as client:
         # 1 ── Recent finished contests
         contests = await _find_recent_contests(client)
         if not contests:
