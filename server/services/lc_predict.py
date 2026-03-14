@@ -1,0 +1,482 @@
+"""
+LeetCode Rating Predictor
+─────────────────────────
+Implements the same Elo-style algorithm used by CF / Carrot / lcpredictor.
+
+Flow:
+  1. Find recently FINISHED LC contests (within 6 hours)
+  2. Check if the target user participated via userContestRankingHistory
+  3. Detect if official ratings are already published (rating comparison)
+  4. Sample contest standings via REST API  (paginated, ~1500 users)
+  5. Batch-fetch current ratings for sampled users via GraphQL aliases
+  6. Run Elo prediction on the sample (scale-invariant → accurate)
+
+Caches standings + ratings per contest so repeated queries are instant.
+"""
+
+import httpx
+import asyncio
+import math
+import time
+import json
+from typing import Optional, Dict, List, Tuple
+
+LC_GQL = "https://leetcode.com/graphql"
+LC_RANK_API = "https://leetcode.com/contest/api/ranking"
+GQL_HEADERS = {
+    "Content-Type": "application/json",
+    "Referer": "https://leetcode.com",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+}
+REST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Referer": "https://leetcode.com",
+    "Accept": "application/json",
+}
+
+# ── Caches ───────────────────────────────────────────────────────────────────
+# {contest_slug: {participants: [...], total_users: int, _ts: float}}
+_standings_cache: Dict[str, dict] = {}
+# {(contest_slug, handle_lower): prediction_dict}
+_pred_cache: Dict[tuple, dict] = {}
+CACHE_TTL = 6 * 3600  # 6 hours
+
+# ── Tuning ───────────────────────────────────────────────────────────────────
+SAMPLE_PAGES = 60       # ~1500 users evenly spread
+MAX_RANK = 15000        # Ignore ranks below this (negligible Elo impact)
+RATING_BATCH = 60       # Users per GraphQL aliased request
+CONCURRENCY = 12        # Max parallel requests
+PREDICTION_WINDOW = 6   # Hours after contest end to show prediction
+
+
+# ── Public API ───────────────────────────────────────────────────────────────
+
+async def get_prediction(handle: str) -> Optional[dict]:
+    """
+    Return a rating prediction for `handle` if there's a recent LC contest
+    where the user participated but official ratings haven't dropped yet.
+    Returns None if no prediction available.
+    """
+    async with httpx.AsyncClient(
+        timeout=20, follow_redirects=True, headers=REST_HEADERS
+    ) as client:
+        # 1 ── Recent finished contests
+        contests = await _find_recent_contests(client)
+        if not contests:
+            return None
+
+        # 2 ── Fetch user's contest history + current rating
+        history_data = await _get_user_history(client, handle)
+        if not history_data:
+            return None
+
+        attended, current_rating = history_data
+
+        # 3 ── For each candidate contest, check participation
+        for contest in contests:
+            slug = contest["titleSlug"]
+            contest_name = contest["title"]
+
+            part = _check_participation_in_history(attended, contest_name)
+            if not part:
+                continue
+            if part["ratings_published"]:
+                continue
+
+            user_rank = part["rank"]
+            pre_contest_rating = part["pre_contest_rating"]
+
+            # 4 ── Cache check
+            now = time.time()
+            cache_key = (slug, handle.lower())
+            if cache_key in _pred_cache:
+                cached = _pred_cache[cache_key]
+                if now - cached.get("_ts", 0) < CACHE_TTL:
+                    return {k: v for k, v in cached.items() if k != "_ts"}
+
+            # 5 ── Fetch sampled standings + ratings
+            if slug in _standings_cache and now - _standings_cache[slug].get("_ts", 0) < CACHE_TTL:
+                participants = _standings_cache[slug]["participants"]
+                total_users = _standings_cache[slug]["total_users"]
+            else:
+                result = await _fetch_sampled_standings(client, slug, user_rank)
+                if not result:
+                    continue
+                participants, total_users = result
+                _standings_cache[slug] = {
+                    "participants": participants,
+                    "total_users": total_users,
+                    "_ts": now,
+                }
+
+            # 6 ── Ensure user is in the sample
+            participants = [dict(p) for p in participants]  # shallow copy
+            user_in_sample = False
+            for p in participants:
+                if p["handle"].lower() == handle.lower():
+                    user_in_sample = True
+                    p["rating"] = pre_contest_rating
+                    break
+
+            if not user_in_sample:
+                participants.append({
+                    "handle": handle,
+                    "rank": user_rank,
+                    "rating": pre_contest_rating,
+                })
+
+            # Sort by rank and assign sample positions
+            participants.sort(key=lambda x: x["rank"])
+
+            user_idx = None
+            for i, p in enumerate(participants):
+                p["sample_rank"] = i + 1  # 1-based position in sample
+                if p["handle"].lower() == handle.lower():
+                    user_idx = i
+
+            if user_idx is None:
+                continue
+
+            # 7 ── Elo prediction
+            prediction = _elo_predict(participants, user_idx)
+            prediction["contest_name"] = contest_name
+            prediction["contest_slug"] = slug
+            prediction["total_participants"] = total_users
+
+            _pred_cache[cache_key] = {**prediction, "_ts": now}
+            return prediction
+
+    return None
+
+
+# ── Internals ────────────────────────────────────────────────────────────────
+
+async def _find_recent_contests(client) -> list:
+    """Find finished LC contests within PREDICTION_WINDOW hours."""
+    query = {
+        "query": """
+        query {
+            allContests {
+                title
+                titleSlug
+                startTime
+                duration
+            }
+        }
+        """,
+    }
+    try:
+        resp = await client.post(LC_GQL, json=query, headers=GQL_HEADERS)
+        if resp.status_code != 200:
+            return []
+        data = resp.json().get("data", {})
+        contests = data.get("allContests", [])
+    except Exception:
+        return []
+
+    now = time.time()
+    results = []
+    for c in contests:
+        start = c.get("startTime", 0)
+        duration = c.get("duration", 0)
+        end = start + duration
+
+        if now < end:
+            continue  # ongoing or future
+
+        age_hours = (now - end) / 3600
+        if age_hours > PREDICTION_WINDOW:
+            break  # sorted newest-first
+
+        results.append(c)
+
+    return results
+
+
+async def _get_user_history(client, handle: str):
+    """
+    Fetch user's contest ranking history and current rating.
+    Returns (attended_list, current_rating) or None.
+    """
+    query = {
+        "query": """
+        query ($username: String!) {
+            userContestRankingHistory(username: $username) {
+                attended
+                rating
+                ranking
+                contest {
+                    title
+                    startTime
+                }
+            }
+            userContestRanking(username: $username) {
+                rating
+            }
+        }
+        """,
+        "variables": {"username": handle},
+    }
+    try:
+        resp = await client.post(LC_GQL, json=query, headers=GQL_HEADERS)
+        if resp.status_code != 200:
+            return None
+        data = resp.json().get("data", {})
+    except Exception:
+        return None
+
+    history = data.get("userContestRankingHistory")
+    if not history:
+        return None
+
+    # Filter to attended and sort chronologically
+    attended = [h for h in history if h.get("attended")]
+    attended.sort(key=lambda x: x.get("contest", {}).get("startTime", 0))
+
+    cr = data.get("userContestRanking")
+    current_rating = round(cr["rating"]) if cr and cr.get("rating") else 1500
+
+    return attended, current_rating
+
+
+def _check_participation_in_history(attended: list, contest_name: str) -> Optional[dict]:
+    """
+    Check if user participated in a specific contest.
+    Returns {rank, pre_contest_rating, ratings_published} or None.
+    """
+    target_idx = None
+    for i, h in enumerate(attended):
+        if h.get("contest", {}).get("title") == contest_name:
+            target_idx = i
+            break
+
+    if target_idx is None:
+        return None
+
+    target = attended[target_idx]
+    rank = target.get("ranking", 0)
+    if rank <= 0:
+        return None
+
+    # Pre-contest rating = rating after the PREVIOUS contest
+    if target_idx > 0:
+        pre_contest_rating = round(attended[target_idx - 1]["rating"])
+    else:
+        pre_contest_rating = 1500  # First contest
+
+    # Detect if ratings are published:
+    # If this entry's rating differs from pre-contest → published
+    # If same → pending (or delta=0, harmless false positive)
+    target_rating = target.get("rating", 0)
+    ratings_published = False
+    if target_rating > 0 and abs(target_rating - pre_contest_rating) > 0.5:
+        ratings_published = True
+
+    return {
+        "rank": rank,
+        "pre_contest_rating": pre_contest_rating,
+        "ratings_published": ratings_published,
+    }
+
+
+async def _fetch_sampled_standings(
+    client, contest_slug: str, user_rank: int
+) -> Optional[Tuple[List[dict], int]]:
+    """
+    Fetch sampled standings via REST API + ratings via GraphQL.
+    Returns (participants, total_user_count) or None.
+    """
+    # Page 1 → total user count
+    try:
+        resp = await client.get(
+            f"{LC_RANK_API}/{contest_slug}/",
+            params={"pagination": 1, "region": "global"},
+        )
+        if resp.status_code != 200:
+            return None
+        page1 = resp.json()
+        total_users = page1.get("user_num", 0)
+        if total_users == 0:
+            return None
+    except Exception:
+        return None
+
+    total_pages = math.ceil(total_users / 25)
+    effective_max = min(total_users, MAX_RANK)
+    effective_pages = math.ceil(effective_max / 25)
+
+    # Determine pages to sample
+    pages_to_fetch = set()
+
+    if effective_pages <= SAMPLE_PAGES:
+        pages_to_fetch = set(range(1, effective_pages + 1))
+    else:
+        step = effective_pages / SAMPLE_PAGES
+        for i in range(SAMPLE_PAGES):
+            pages_to_fetch.add(min(int(1 + i * step), effective_pages))
+
+    # Pages around user's rank
+    user_page = max(1, math.ceil(user_rank / 25))
+    for p in range(max(1, user_page - 3), min(effective_pages + 1, user_page + 4)):
+        pages_to_fetch.add(p)
+
+    pages_to_fetch.add(1)
+    pages_to_fetch.add(effective_pages)
+    pages_to_fetch = sorted(pages_to_fetch)
+
+    # ── Fetch standings pages concurrently ──
+    sem = asyncio.Semaphore(CONCURRENCY)
+    all_users: List[dict] = []
+
+    # Collect page 1 users
+    for u in page1.get("total_rank", []):
+        all_users.append({
+            "handle": u["username"],
+            "rank": u["rank"],
+            "rating": 1500,
+        })
+
+    async def fetch_page(page_num):
+        if page_num == 1:
+            return
+        async with sem:
+            try:
+                r = await client.get(
+                    f"{LC_RANK_API}/{contest_slug}/",
+                    params={"pagination": page_num, "region": "global"},
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    for u in data.get("total_rank", []):
+                        all_users.append({
+                            "handle": u["username"],
+                            "rank": u["rank"],
+                            "rating": 1500,
+                        })
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
+
+    tasks = [fetch_page(p) for p in pages_to_fetch if p != 1]
+    await asyncio.gather(*tasks)
+
+    if not all_users:
+        return None
+
+    # Deduplicate
+    seen = set()
+    unique_users = []
+    for u in all_users:
+        key = u["handle"].lower()
+        if key not in seen:
+            seen.add(key)
+            unique_users.append(u)
+
+    # ── Batch-fetch ratings via GraphQL aliases ──
+    handles = [u["handle"] for u in unique_users]
+    ratings = await _batch_fetch_ratings(client, handles)
+
+    for u in unique_users:
+        if u["handle"] in ratings:
+            u["rating"] = ratings[u["handle"]]
+
+    return unique_users, total_users
+
+
+async def _batch_fetch_ratings(client, handles: List[str]) -> Dict[str, int]:
+    """
+    Fetch current contest ratings for many users using GraphQL aliased queries.
+    E.g., { u0: userContestRanking(username: "X") { rating } u1: ... }
+    """
+    ratings: Dict[str, int] = {}
+    sem = asyncio.Semaphore(CONCURRENCY)
+
+    async def fetch_batch(batch_handles: List[str], batch_idx: int):
+        # Build aliased query
+        parts = []
+        alias_map = {}
+        for i, h in enumerate(batch_handles):
+            safe_alias = f"u{batch_idx}x{i}"
+            # Escape username for GraphQL string literal
+            escaped = h.replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(
+                f'{safe_alias}: userContestRanking(username: "{escaped}") {{ rating }}'
+            )
+            alias_map[safe_alias] = h
+
+        query_str = "{ " + " ".join(parts) + " }"
+
+        async with sem:
+            try:
+                resp = await client.post(
+                    LC_GQL,
+                    json={"query": query_str},
+                    headers=GQL_HEADERS,
+                )
+                if resp.status_code == 200:
+                    data = resp.json().get("data") or {}
+                    for alias, handle in alias_map.items():
+                        entry = data.get(alias)
+                        if entry and entry.get("rating"):
+                            ratings[handle] = round(entry["rating"])
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
+
+    # Create batches
+    tasks = []
+    for i in range(0, len(handles), RATING_BATCH):
+        batch = handles[i : i + RATING_BATCH]
+        tasks.append(fetch_batch(batch, i // RATING_BATCH))
+
+    await asyncio.gather(*tasks)
+    return ratings
+
+
+def _elo_predict(participants: List[dict], user_idx: int) -> dict:
+    """
+    Elo-style prediction (same formula as CF / Carrot / lcpredictor).
+
+    Uses sample_rank (position in the sample) instead of actual rank,
+    because the sample is uniform and the formula is scale-invariant.
+
+    Algorithm:
+      seed(R) = 1 + Σ_{j≠i} 1/(1 + 10^((R − rⱼ)/400))
+      midRank = √(sample_rank × seed(current_rating))
+      Binary search for R* such that seed(R*) = midRank
+      delta = (R* − current_rating) / 2
+    """
+    user = participants[user_idx]
+    user_rating = user["rating"]
+    user_rank = user["sample_rank"]  # position in the sample, not actual rank
+
+    others = [p["rating"] for i, p in enumerate(participants) if i != user_idx]
+
+    def get_seed(rating):
+        s = 1.0
+        for r in others:
+            s += 1.0 / (1.0 + 10.0 ** ((rating - r) / 400.0))
+        return s
+
+    seed = get_seed(user_rating)
+    mid_rank = math.sqrt(user_rank * seed)
+
+    # Binary search for R*
+    lo, hi = 1, 8000
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if get_seed(mid) < mid_rank:
+            hi = mid
+        else:
+            lo = mid
+
+    R_star = lo
+    delta = (R_star - user_rating) // 2
+    predicted = user_rating + delta
+
+    return {
+        "old_rating": user_rating,
+        "predicted_rating": predicted,
+        "predicted_change": delta,
+        "rank": participants[user_idx]["rank"],  # actual contest rank for display
+    }
