@@ -42,11 +42,25 @@ _pred_cache: Dict[tuple, dict] = {}
 CACHE_TTL = 6 * 3600  # 6 hours
 
 # ── Tuning ───────────────────────────────────────────────────────────────────
-SAMPLE_PAGES = 60       # ~1500 users evenly spread
-MAX_RANK = 15000        # Ignore ranks below this (negligible Elo impact)
+SAMPLE_PAGES = 60       # ~1500 users evenly spread across ALL ranks
 RATING_BATCH = 60       # Users per GraphQL aliased request
 CONCURRENCY = 12        # Max parallel requests
 PREDICTION_WINDOW = 6   # Hours after contest end to show prediction
+
+
+def _delta_coefficient(k: int) -> float:
+    """
+    LeetCode's official delta multiplier based on attendedContestsCount.
+    f(k) = 1 / (1 + sum((5/7)^i for i in 0..k))
+    For experienced users (k large), converges to 2/9 ≈ 0.222.
+    For first contest (k=0), f(0) = 0.5.
+    """
+    if k <= 0:
+        return 0.5
+    if k > 100:
+        return 2 / 9
+    sigma = sum((5 / 7) ** i for i in range(k + 1))
+    return 1 / (1 + sigma)
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -70,7 +84,7 @@ async def get_prediction(handle: str) -> Optional[dict]:
         if not history_data:
             return None
 
-        attended, current_rating = history_data
+        attended, current_rating, attended_count = history_data
 
         # 3 ── For each candidate contest, check participation
         for contest in contests:
@@ -87,11 +101,13 @@ async def get_prediction(handle: str) -> Optional[dict]:
                 # Use current rating as pre-contest rating (best approximation)
                 pre_contest_rating = current_rating
                 ratings_published = False
+                user_attended_count = attended_count
             else:
                 if part["ratings_published"]:
                     continue
                 user_rank = part["rank"]
                 pre_contest_rating = part["pre_contest_rating"]
+                user_attended_count = attended_count
 
             # 4 ── Cache check
             now = time.time()
@@ -145,7 +161,7 @@ async def get_prediction(handle: str) -> Optional[dict]:
                 continue
 
             # 7 ── Elo prediction
-            prediction = _elo_predict(participants, user_idx)
+            prediction = _elo_predict(participants, user_idx, user_attended_count, total_users)
             prediction["contest_name"] = contest_name
             prediction["contest_slug"] = slug
             prediction["total_participants"] = total_users
@@ -265,8 +281,8 @@ async def _find_recent_contests(client) -> list:
 
 async def _get_user_history(client, handle: str):
     """
-    Fetch user's contest ranking history and current rating.
-    Returns (attended_list, current_rating) or None.
+    Fetch user's contest ranking history, current rating, and attended count.
+    Returns (attended_list, current_rating, attended_count) or None.
     """
     query = {
         "query": """
@@ -282,6 +298,7 @@ async def _get_user_history(client, handle: str):
             }
             userContestRanking(username: $username) {
                 rating
+                attendedContestsCount
             }
         }
         """,
@@ -305,8 +322,9 @@ async def _get_user_history(client, handle: str):
 
     cr = data.get("userContestRanking")
     current_rating = round(cr["rating"]) if cr and cr.get("rating") else 1500
+    attended_count = cr.get("attendedContestsCount", len(attended)) if cr else len(attended)
 
-    return attended, current_rating
+    return attended, current_rating, attended_count
 
 
 def _check_participation_in_history(attended: list, contest_name: str) -> Optional[dict]:
@@ -372,8 +390,7 @@ async def _fetch_sampled_standings(
         return None
 
     total_pages = math.ceil(total_users / 25)
-    effective_max = min(total_users, MAX_RANK)
-    effective_pages = math.ceil(effective_max / 25)
+    effective_pages = total_pages  # Sample across ALL ranks, no cap
 
     # Determine pages to sample
     pages_to_fetch = set()
@@ -503,22 +520,26 @@ async def _batch_fetch_ratings(client, handles: List[str]) -> Dict[str, int]:
     return ratings
 
 
-def _elo_predict(participants: List[dict], user_idx: int) -> dict:
+def _elo_predict(participants: List[dict], user_idx: int, attended_count: int = 0, total_users: int = 0) -> dict:
     """
-    Elo-style prediction (same formula as CF / Carrot / lcpredictor).
+    Elo-style prediction matching LeetCode's official algorithm (same as Enthrahub/lccn_predictor).
 
-    Uses sample_rank (position in the sample) instead of actual rank,
-    because the sample is uniform and the formula is scale-invariant.
+    The seed from the sample is scaled by (total_users / sample_size) to represent
+    the full participant pool. The actual contest rank is used for midRank.
 
     Algorithm:
-      seed(R) = 1 + Σ_{j≠i} 1/(1 + 10^((R − rⱼ)/400))
-      midRank = √(sample_rank × seed(current_rating))
+      seed(R) = scale * (1 + Σ_{j≠i} 1/(1 + 10^((R − rⱼ)/400)))
+      midRank = √(actual_rank × seed(current_rating))
       Binary search for R* such that seed(R*) = midRank
-      delta = (R* − current_rating) / 2
+      delta = (R* − current_rating) × f(attendedContestsCount)
     """
     user = participants[user_idx]
     user_rating = user["rating"]
-    user_rank = user["sample_rank"]  # position in the sample, not actual rank
+    actual_rank = user["rank"]  # actual contest rank
+    sample_size = len(participants)
+
+    # Scale factor: extrapolate sample seed to full population
+    scale = total_users / sample_size if total_users > sample_size else 1.0
 
     others = [p["rating"] for i, p in enumerate(participants) if i != user_idx]
 
@@ -526,10 +547,10 @@ def _elo_predict(participants: List[dict], user_idx: int) -> dict:
         s = 1.0
         for r in others:
             s += 1.0 / (1.0 + 10.0 ** ((rating - r) / 400.0))
-        return s
+        return s * scale
 
     seed = get_seed(user_rating)
-    mid_rank = math.sqrt(user_rank * seed)
+    mid_rank = math.sqrt(actual_rank * seed)
 
     # Binary search for R*
     lo, hi = 1, 8000
@@ -541,12 +562,14 @@ def _elo_predict(participants: List[dict], user_idx: int) -> dict:
             lo = mid
 
     R_star = lo
-    delta = (R_star - user_rating) // 2
+    # Use f(k) multiplier instead of flat 0.5
+    coeff = _delta_coefficient(attended_count)
+    delta = round((R_star - user_rating) * coeff)
     predicted = user_rating + delta
 
     return {
         "old_rating": user_rating,
         "predicted_rating": predicted,
         "predicted_change": delta,
-        "rank": participants[user_idx]["rank"],  # actual contest rank for display
+        "rank": actual_rank,
     }
