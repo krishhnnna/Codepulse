@@ -5,12 +5,11 @@ set -e
 echo "=== Installing Python dependencies ==="
 pip install -r requirements.txt
 
-echo "=== Installing Playwright Chromium ==="
-# Install browsers inside the project dir so they persist at runtime
-export PLAYWRIGHT_BROWSERS_PATH=$PWD/.playwright-browsers
-playwright install --with-deps chromium || playwright install chromium
+echo "=== Installing Playwright Chromium + system deps ==="
+# Install to DEFAULT cache path so runtime finds it automatically
+playwright install --with-deps chromium
 
 echo "=== Verifying Chromium install ==="
-ls -la $PLAYWRIGHT_BROWSERS_PATH/ || echo "Browser dir listing failed"
+python3 -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage']); print('Chromium OK:', b.version); b.close(); p.stop()"
 
 echo "=== Build complete ==="
