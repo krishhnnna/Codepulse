@@ -143,6 +143,7 @@ export default function ContestRatingGraph() {
     }
 
     let cancelled = false;
+    setPrediction(null);  // Clear old prediction immediately on switch
     setPredLoading(true);
     fetcher(handle)
       .then((res) => {
@@ -255,7 +256,7 @@ export default function ContestRatingGraph() {
 
       {/* Chart */}
       <div className="h-72">
-        <ResponsiveContainer width="100%" height="100%">
+        <ResponsiveContainer key={selected} width="100%" height="100%">
           <ComposedChart data={data} margin={{ top: 10, right: 10, left: -10, bottom: 0 }}>
             <defs>
               <linearGradient id={`grad-${selected}`} x1="0" y1="0" x2="0" y2="1">
