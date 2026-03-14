@@ -56,11 +56,17 @@ async def _get_cf_cookies() -> Dict[str, str]:
     log.info("[CF-BYPASS] Launching headless Chrome to get Cloudflare cookies...")
     
     try:
+        # Set browser path to match build.sh install location
+        _server_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _pw_path = os.path.join(_server_dir, ".playwright-browsers")
+        if os.path.isdir(_pw_path):
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _pw_path
+        
         from playwright.async_api import async_playwright
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
-                args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
+                args=['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage']
             )
             context = await browser.new_context(
                 user_agent=REST_HEADERS["User-Agent"],

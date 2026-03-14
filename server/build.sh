@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
 # Render Build Script
-# Installs Python dependencies + Playwright Chromium for Cloudflare bypass
-
 set -e
 
 echo "=== Installing Python dependencies ==="
 pip install -r requirements.txt
 
-echo "=== Installing Playwright system deps ==="
-# Install Playwright browsers + system dependencies
-# On Render (Ubuntu), --with-deps installs libgbm, libnss3, etc.
-PLAYWRIGHT_BROWSERS_PATH=/opt/render/.cache/ms-playwright playwright install --with-deps chromium || {
-    echo "=== --with-deps failed, trying without ==="
-    PLAYWRIGHT_BROWSERS_PATH=/opt/render/.cache/ms-playwright playwright install chromium
-}
+echo "=== Installing Playwright Chromium ==="
+# Install browsers inside the project dir so they persist at runtime
+export PLAYWRIGHT_BROWSERS_PATH=$PWD/.playwright-browsers
+playwright install --with-deps chromium || playwright install chromium
+
+echo "=== Verifying Chromium install ==="
+ls -la $PLAYWRIGHT_BROWSERS_PATH/ || echo "Browser dir listing failed"
 
 echo "=== Build complete ==="
