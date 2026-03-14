@@ -58,7 +58,7 @@ async def get_prediction(handle: str) -> Optional[dict]:
     Returns None if no prediction available.
     """
     async with httpx.AsyncClient(
-        timeout=20, follow_redirects=True, headers=REST_HEADERS
+        timeout=120, follow_redirects=True, headers=REST_HEADERS
     ) as client:
         # 1 ── Recent finished contests
         contests = await _find_recent_contests(client)
@@ -78,13 +78,20 @@ async def get_prediction(handle: str) -> Optional[dict]:
             contest_name = contest["title"]
 
             part = _check_participation_in_history(attended, contest_name)
-            if not part:
-                continue
-            if part["ratings_published"]:
-                continue
 
-            user_rank = part["rank"]
-            pre_contest_rating = part["pre_contest_rating"]
+            # Fallback: if history hasn't updated yet, search REST API directly
+            if not part:
+                user_rank = await _find_user_rank_in_contest(client, slug, handle)
+                if user_rank is None:
+                    continue  # User didn't participate
+                # Use current rating as pre-contest rating (best approximation)
+                pre_contest_rating = current_rating
+                ratings_published = False
+            else:
+                if part["ratings_published"]:
+                    continue
+                user_rank = part["rank"]
+                pre_contest_rating = part["pre_contest_rating"]
 
             # 4 ── Cache check
             now = time.time()
@@ -147,6 +154,69 @@ async def get_prediction(handle: str) -> Optional[dict]:
             return prediction
 
     return None
+
+
+async def _find_user_rank_in_contest(client, contest_slug: str, handle: str) -> Optional[int]:
+    """
+    Search for a user in the contest ranking API by scanning ALL pages
+    concurrently. Returns the user's rank if found, None otherwise.
+    Uses 25 concurrent requests to scan ~1500 pages in ~30-60s.
+    """
+    # Get total users first
+    try:
+        resp = await client.get(
+            f"{LC_RANK_API}/{contest_slug}/",
+            params={"pagination": 1, "region": "global"},
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        total_users = data.get("user_num", 0)
+        if total_users == 0:
+            return None
+
+        # Check page 1
+        for u in data.get("total_rank", []):
+            if u["username"].lower() == handle.lower():
+                return u["rank"]
+    except Exception:
+        return None
+
+    total_pages = math.ceil(total_users / 25)
+    handle_lower = handle.lower()
+    found_rank = None
+    sem = asyncio.Semaphore(25)  # 25 concurrent requests
+
+    async def scan_page(page_num):
+        nonlocal found_rank
+        if found_rank is not None:
+            return  # Short-circuit if already found
+        async with sem:
+            if found_rank is not None:
+                return
+            try:
+                r = await client.get(
+                    f"{LC_RANK_API}/{contest_slug}/",
+                    params={"pagination": page_num, "region": "global"},
+                )
+                if r.status_code == 200:
+                    for u in r.json().get("total_rank", []):
+                        if u["username"].lower() == handle_lower:
+                            found_rank = u["rank"]
+                            return
+            except Exception:
+                pass
+
+    # Scan ALL pages in batches to avoid overwhelming the event loop
+    all_pages = list(range(2, total_pages + 1))
+    BATCH = 100
+    for i in range(0, len(all_pages), BATCH):
+        if found_rank is not None:
+            break
+        batch = all_pages[i:i + BATCH]
+        await asyncio.gather(*[scan_page(p) for p in batch])
+
+    return found_rank
 
 
 # ── Internals ────────────────────────────────────────────────────────────────
