@@ -78,9 +78,8 @@ function CustomTooltip({ active, payload }) {
           {d.rating}
         </span>
         {!isNeutral && (
-          <span className={`stat-number text-xs font-bold ${
-            isPositive ? 'text-emerald-500' : 'text-red-500'
-          }`}>
+          <span className={`stat-number text-xs font-bold ${isPositive ? 'text-emerald-500' : 'text-red-500'
+            }`}>
             {isPositive ? '▲' : '▼'} {Math.abs(change)}
           </span>
         )}
@@ -120,6 +119,7 @@ export default function ContestRatingGraph() {
   // Rating prediction state
   const [prediction, setPrediction] = useState(null);
   const [predLoading, setPredLoading] = useState(false);
+  const [predPlatform, setPredPlatform] = useState(null); // track which platform the prediction is for
 
   // Only show platforms that have handles set
   const availablePlatforms = Object.keys(platforms).filter((k) => handles[k]);
@@ -131,6 +131,12 @@ export default function ContestRatingGraph() {
   const text = darkMode ? '#52525b' : '#a1a1aa';
   const refLines = rankLines[selected] || [];
 
+  // Clear prediction immediately when platform changes
+  useEffect(() => {
+    setPrediction(null);
+    setPredPlatform(null);
+  }, [selected]);
+
   // Fetch prediction when a supported platform tab is active
   useEffect(() => {
     const predictable = { codeforces: fetchCFPrediction, leetcode: fetchLCPrediction };
@@ -139,42 +145,46 @@ export default function ContestRatingGraph() {
 
     if (!fetcher || !handle || rawData.length === 0) {
       setPrediction(null);
+      setPredPlatform(null);
       return;
     }
 
     let cancelled = false;
-    setPrediction(null);  // Clear old prediction immediately on switch
     setPredLoading(true);
+    const currentPlatform = selected; // capture platform at fetch time
     fetcher(handle)
       .then((res) => {
         if (!cancelled && res?.prediction) {
           setPrediction(res.prediction);
+          setPredPlatform(currentPlatform);
         } else if (!cancelled) {
           setPrediction(null);
+          setPredPlatform(null);
         }
       })
-      .catch(() => { if (!cancelled) setPrediction(null); })
+      .catch(() => { if (!cancelled) { setPrediction(null); setPredPlatform(null); } })
       .finally(() => { if (!cancelled) setPredLoading(false); });
 
     return () => { cancelled = true; };
   }, [selected, handles, rawData.length]);
 
-  // Merge prediction into data
-  const hasPrediction = !!prediction;
+  // Merge prediction into data ONLY if it matches the current platform
+  const activePrediction = (prediction && predPlatform === selected) ? prediction : null;
+  const hasPrediction = !!activePrediction;
   const data = useMemo(() => {
-    if (!prediction) return rawData;
+    if (!activePrediction) return rawData;
     return [
       ...rawData,
       {
         date: new Date().toISOString().split('T')[0],
-        rating: prediction.predicted_rating,
-        change: prediction.predicted_change,
-        contest: prediction.contest_name,
+        rating: activePrediction.predicted_rating,
+        change: activePrediction.predicted_change,
+        contest: activePrediction.contest_name,
         predicted: true,
-        rank: prediction.rank,
+        rank: activePrediction.rank,
       },
     ];
-  }, [rawData, prediction]);
+  }, [rawData, activePrediction]);
 
   const { current, peak, contests, lastChange } = useMemo(() => {
     if (!rawData || rawData.length === 0) return { current: 0, peak: 0, contests: 0, lastChange: 0 };
@@ -217,11 +227,10 @@ export default function ContestRatingGraph() {
             <button
               key={key}
               onClick={() => setSelected(key)}
-              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors flex items-center gap-1.5 ${
-                selected === key
+              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors flex items-center gap-1.5 ${selected === key
                   ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-white shadow-sm'
                   : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-300'
-              }`}
+                }`}
             >
               <PlatformIcon platform={key} size={14} />
               {cfg.name}
@@ -246,9 +255,8 @@ export default function ContestRatingGraph() {
         </div>
         <div className="bg-zinc-50 dark:bg-zinc-800/50 rounded-xl px-4 py-3">
           <div className="text-[10px] uppercase tracking-wider text-zinc-400 mb-1">Last</div>
-          <div className={`stat-number text-xl font-bold ${
-            lastChange > 0 ? 'text-emerald-500' : lastChange < 0 ? 'text-red-500' : 'text-zinc-900 dark:text-white'
-          }`}>
+          <div className={`stat-number text-xl font-bold ${lastChange > 0 ? 'text-emerald-500' : lastChange < 0 ? 'text-red-500' : 'text-zinc-900 dark:text-white'
+            }`}>
             {lastChange > 0 ? '+' : ''}{lastChange}
           </div>
         </div>
