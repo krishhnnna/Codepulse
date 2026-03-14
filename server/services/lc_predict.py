@@ -71,20 +71,29 @@ async def get_prediction(handle: str) -> Optional[dict]:
     where the user participated but official ratings haven't dropped yet.
     Returns None if no prediction available.
     """
+    import logging
+    log = logging.getLogger("lc_predict")
+    log.info(f"[LC-PREDICT] Starting prediction for {handle}")
+
     async with httpx.AsyncClient(
         timeout=120, follow_redirects=True, headers=REST_HEADERS
     ) as client:
         # 1 ── Recent finished contests
         contests = await _find_recent_contests(client)
         if not contests:
+            log.info("[LC-PREDICT] No recent contests found")
             return None
+
+        log.info(f"[LC-PREDICT] Found {len(contests)} recent contests: {[c['title'] for c in contests]}")
 
         # 2 ── Fetch user's contest history + current rating
         history_data = await _get_user_history(client, handle)
         if not history_data:
+            log.info("[LC-PREDICT] No user history data")
             return None
 
         attended, current_rating, attended_count = history_data
+        log.info(f"[LC-PREDICT] User rating={current_rating}, attended={attended_count}, history_len={len(attended)}")
 
         # 3 ── For each candidate contest, check participation
         for contest in contests:
@@ -95,19 +104,24 @@ async def get_prediction(handle: str) -> Optional[dict]:
 
             # Fallback: if history hasn't updated yet, search REST API directly
             if not part:
+                log.info(f"[LC-PREDICT] '{contest_name}' not in history, trying fallback rank scan...")
                 user_rank = await _find_user_rank_in_contest(client, slug, handle)
                 if user_rank is None:
+                    log.info(f"[LC-PREDICT] User not found in '{contest_name}' standings")
                     continue  # User didn't participate
+                log.info(f"[LC-PREDICT] Fallback found user at rank {user_rank}")
                 # Use current rating as pre-contest rating (best approximation)
                 pre_contest_rating = current_rating
                 ratings_published = False
                 user_attended_count = attended_count
             else:
                 if part["ratings_published"]:
+                    log.info(f"[LC-PREDICT] Ratings already published for '{contest_name}'")
                     continue
                 user_rank = part["rank"]
                 pre_contest_rating = part["pre_contest_rating"]
                 user_attended_count = attended_count
+                log.info(f"[LC-PREDICT] Found in history: rank={user_rank}, pre_rating={pre_contest_rating}")
 
             # 4 ── Cache check
             now = time.time()
@@ -115,6 +129,7 @@ async def get_prediction(handle: str) -> Optional[dict]:
             if cache_key in _pred_cache:
                 cached = _pred_cache[cache_key]
                 if now - cached.get("_ts", 0) < CACHE_TTL:
+                    log.info(f"[LC-PREDICT] Returning cached prediction")
                     return {k: v for k, v in cached.items() if k != "_ts"}
 
             # 5 ── Fetch sampled standings + ratings
@@ -124,6 +139,7 @@ async def get_prediction(handle: str) -> Optional[dict]:
             else:
                 result = await _fetch_sampled_standings(client, slug, user_rank)
                 if not result:
+                    log.info(f"[LC-PREDICT] Failed to fetch standings for '{contest_name}'")
                     continue
                 participants, total_users = result
                 _standings_cache[slug] = {
@@ -131,6 +147,8 @@ async def get_prediction(handle: str) -> Optional[dict]:
                     "total_users": total_users,
                     "_ts": now,
                 }
+
+            log.info(f"[LC-PREDICT] Got {len(participants)} sampled participants, total={total_users}")
 
             # 6 ── Ensure user is in the sample
             participants = [dict(p) for p in participants]  # shallow copy
@@ -158,6 +176,7 @@ async def get_prediction(handle: str) -> Optional[dict]:
                     user_idx = i
 
             if user_idx is None:
+                log.info(f"[LC-PREDICT] User not found in sorted participants")
                 continue
 
             # 7 ── Elo prediction
@@ -166,9 +185,11 @@ async def get_prediction(handle: str) -> Optional[dict]:
             prediction["contest_slug"] = slug
             prediction["total_participants"] = total_users
 
+            log.info(f"[LC-PREDICT] Prediction: {prediction}")
             _pred_cache[cache_key] = {**prediction, "_ts": now}
             return prediction
 
+    log.info("[LC-PREDICT] No prediction available (end of loop)")
     return None
 
 
