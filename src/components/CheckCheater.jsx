@@ -23,26 +23,26 @@ function normalise(key, raw) {
 
   if (key === 'codeforces') {
     const plagiarism = raw.skippedContests || [];
-    const revoked    = raw.ghostContests || [];
+    // const revoked    = raw.ghostContests || [];
     const anomalies  = raw.anomalies || [];
     const total      = raw.totalRatedContests || 0;
 
     stats.push({ label: 'Rated Contests', value: total, color: '#318CE7' });
     stats.push({ label: 'Plagiarism Detected', value: plagiarism.length, color: '#ef4444' });
-    stats.push({ label: 'Participation Revoked', value: revoked.length, color: '#f59e0b' });
+    // stats.push({ label: 'Participation Revoked', value: revoked?.length || 0, color: '#f59e0b' });
     if (anomalies.length) stats.push({ label: 'Rating Anomalies', value: anomalies.length, color: '#f97316' });
 
     plagiarism.forEach(c => flags.push({ ...c, tag: 'Plagiarism', tagColor: '#ef4444' }));
-    revoked.forEach(c    => flags.push({ ...c, tag: 'Revoked',    tagColor: '#f59e0b' }));
+    // revoked.forEach(c    => flags.push({ ...c, tag: 'Revoked',    tagColor: '#f59e0b' }));
     anomalies.forEach(c  => flags.push({ ...c, tag: `${(c.ratingChange || 0) > 0 ? '+' : ''}${c.ratingChange || 0}`, tagColor: '#f97316' }));
 
     return {
       total,
-      clean: plagiarism.length + revoked.length + anomalies.length,
+      clean: plagiarism.length + anomalies.length,
       segments: [
-        { value: total - plagiarism.length - revoked.length, color: '#10b981' },
+        { value: total - plagiarism.length, color: '#10b981' },
         { value: plagiarism.length, color: '#ef4444' },
-        { value: revoked.length, color: '#f59e0b' },
+        // { value: revoked?.length || 0, color: '#f59e0b' },
       ],
       stats, flags,
     };

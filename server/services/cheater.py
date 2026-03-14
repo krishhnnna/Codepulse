@@ -193,37 +193,42 @@ async def _cf_check(handle: str) -> dict:
     rated_contest_ids = {r["contestId"] for r in rating_changes}
 
     # Contest IDs where user has submissions as CONTESTANT
-    submitted_contest_ids = {}
+    # submitted_contest_ids = {} # Commented out revoked/ghost feature
+    
     # Contests with SKIPPED verdict (plagiarism detected by CF system)
     skipped_contest_ids = {}
+    latest_verdict_checked = set()
 
     for s in submissions:
         cid = s.get("contestId")
         author_type = s.get("author", {}).get("participantType", "")
         verdict = s.get("verdict", "")
 
-        # Track CONTESTANT submissions for ghost detection
-        if cid and author_type == "CONTESTANT":
-            if cid not in submitted_contest_ids:
-                submitted_contest_ids[cid] = {
-                    "contestId": cid,
-                    "contestName": contest_map.get(cid, {}).get("name", f"Contest #{cid}"),
-                    "timestamp": s.get("creationTimeSeconds", 0),
-                    "submissionCount": 0,
-                }
-            submitted_contest_ids[cid]["submissionCount"] += 1
+        if not cid:
+            continue
 
-        # Track SKIPPED verdict submissions (plagiarism flag)
-        if cid and verdict == "SKIPPED":
-            if cid not in skipped_contest_ids:
+        # # Track CONTESTANT submissions for ghost detection (Codeforces Revoked Feature Commented Out)
+        # if cid and author_type == "CONTESTANT":
+        #     if cid not in submitted_contest_ids:
+        #         submitted_contest_ids[cid] = {
+        #             "contestId": cid,
+        #             "contestName": contest_map.get(cid, {}).get("name", f"Contest #{cid}"),
+        #             "timestamp": s.get("creationTimeSeconds", 0),
+        #             "submissionCount": 0,
+        #         }
+        #     submitted_contest_ids[cid]["submissionCount"] += 1
+
+        # Track SKIPPED verdict submissions (plagiarism flag) - Now only checking the latest verdict of the contest
+        if cid not in latest_verdict_checked:
+            latest_verdict_checked.add(cid)
+            if verdict == "SKIPPED":
                 skipped_contest_ids[cid] = {
                     "contestId": cid,
                     "contestName": contest_map.get(cid, {}).get("name", f"Contest #{cid}"),
                     "timestamp": s.get("creationTimeSeconds", 0),
-                    "skippedCount": 0,
+                    "skippedCount": 1,
                     "participantType": author_type,
                 }
-            skipped_contest_ids[cid]["skippedCount"] += 1
 
     # Skipped contests (plagiarism): group by contest
     skipped_contests = sorted(
@@ -232,26 +237,26 @@ async def _cf_check(handle: str) -> dict:
         reverse=True,
     )
 
-    # Ghost contests: user submitted as CONTESTANT but no rating change
-    # ONLY flag if the contest SHOULD have been rated (filter out known unrated)
+    # # Ghost contests: user submitted as CONTESTANT but no rating change
+    # # ONLY flag if the contest SHOULD have been rated (filter out known unrated)
     ghost_contests = []
-    for cid, info in submitted_contest_ids.items():
-        if cid not in rated_contest_ids:
-            # Skip if already flagged as skipped (plagiarism) — avoids double-counting
-            if cid in skipped_contest_ids:
-                continue
-            cname = info["contestName"]
-            ctype = contest_map.get(cid, {}).get("type", "")
-            # Skip known unrated contests — these are NOT suspicious
-            if _is_probably_unrated(cname, ctype):
-                continue
-            # Skip contests with very high IDs (likely gym/unofficial)
-            if cid >= 100000:
-                continue
-            ghost_contests.append(info)
+    # for cid, info in submitted_contest_ids.items():
+    #     if cid not in rated_contest_ids:
+    #         # Skip if already flagged as skipped (plagiarism) — avoids double-counting
+    #         if cid in skipped_contest_ids:
+    #             continue
+    #         cname = info["contestName"]
+    #         ctype = contest_map.get(cid, {}).get("type", "")
+    #         # Skip known unrated contests — these are NOT suspicious
+    #         if _is_probably_unrated(cname, ctype):
+    #             continue
+    #         # Skip contests with very high IDs (likely gym/unofficial)
+    #         if cid >= 100000:
+    #             continue
+    #         ghost_contests.append(info)
 
-    # Sort by timestamp desc
-    ghost_contests.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+    # # Sort by timestamp desc
+    # ghost_contests.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
 
     # Rating anomalies (skip first contest — always a big jump from 0)
     anomalies = []
@@ -272,7 +277,7 @@ async def _cf_check(handle: str) -> dict:
 
     return {
         "totalRatedContests": len(rating_changes),
-        "totalContestSubmissions": len(submitted_contest_ids),
+        "totalContestSubmissions": len(latest_verdict_checked),
         "ghostCount": len(ghost_contests),
         "ghostContests": ghost_contests,
         "skippedCount": len(skipped_contests),
