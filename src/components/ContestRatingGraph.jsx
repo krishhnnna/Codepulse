@@ -230,7 +230,7 @@ export default function ContestRatingGraph() {
       </div>
 
       {/* Summary stats */}
-      <div className={`grid gap-3 mb-5 grid-cols-2 ${hasPrediction ? 'sm:grid-cols-5' : 'sm:grid-cols-4'}`}>
+      <div className="grid gap-3 mb-5 grid-cols-2 sm:grid-cols-4">
         <div className="bg-zinc-50 dark:bg-zinc-800/50 rounded-xl px-4 py-3">
           <div className="text-[10px] uppercase tracking-wider text-zinc-400 mb-1">Current</div>
           <div className="stat-number text-xl font-bold text-zinc-900 dark:text-white">{current}</div>
@@ -251,36 +251,7 @@ export default function ContestRatingGraph() {
             {lastChange > 0 ? '+' : ''}{lastChange}
           </div>
         </div>
-        {/* Predicted delta – only when prediction exists */}
-        {hasPrediction && (
-          <div className="bg-amber-50 dark:bg-amber-500/5 border border-amber-200/50 dark:border-amber-500/10 rounded-xl px-4 py-3">
-            <div className="text-[10px] uppercase tracking-wider text-amber-500 mb-1 flex items-center gap-1">
-              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6l4 2" />
-                <circle cx="12" cy="12" r="9" strokeLinecap="round"/>
-              </svg>
-              Predicted
-            </div>
-            <div className={`stat-number text-xl font-bold ${
-              prediction.predicted_change > 0 ? 'text-emerald-500' : prediction.predicted_change < 0 ? 'text-red-500' : 'text-zinc-900 dark:text-white'
-            }`}>
-              {prediction.predicted_change > 0 ? '+' : ''}{prediction.predicted_change}
-            </div>
-          </div>
-        )}
       </div>
-
-      {/* Prediction banner */}
-      {hasPrediction && (
-        <div className="flex items-center gap-2 mb-4 px-3 py-2 bg-amber-50 dark:bg-amber-500/5 border border-amber-200/40 dark:border-amber-500/10 rounded-lg">
-          <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse shrink-0" />
-          <p className="text-[11px] text-amber-600 dark:text-amber-400/80">
-            <span className="font-semibold">{prediction.contest_name}</span>
-            {' — '}Rating not yet official. Predicted: {prediction.predicted_rating}
-            {prediction.rank ? ` (Rank #${prediction.rank})` : ''}
-          </p>
-        </div>
-      )}
 
       {/* Chart */}
       <div className="h-72">
