@@ -178,7 +178,7 @@ async def _fetch_standings_with_ratings(client, cid):
         if not members:
             continue
         h = members[0]["handle"]
-        participants.append({"handle": h, "rank": row["rank"], "rating": 1500})
+        participants.append({"handle": h, "rank": row["rank"], "rating": 1400})
         handles_list.append(h)
 
     if not participants:
@@ -196,7 +196,7 @@ async def _fetch_standings_with_ratings(client, cid):
             if info.status_code == 200:
                 idata = info.json()
                 if idata.get("status") == "OK":
-                    rmap = {u["handle"]: u.get("rating", 1500) for u in idata["result"]}
+                    rmap = {u["handle"]: u.get("rating", 1400) for u in idata["result"]}
                     for p in participants:
                         if p["handle"] in rmap:
                             p["rating"] = rmap[p["handle"]]
@@ -212,46 +212,84 @@ async def _fetch_standings_with_ratings(client, cid):
 
 def _elo_predict(participants, user_idx):
     """
-    Compute predicted rating for a single user using the CF Elo formula.
+    Compute predicted rating using the full CF Elo formula (same as Carrot).
 
-    Algorithm (per Mike Mirzayanov):
-      seed(R) = 1 + Σ_{j≠i} 1/(1 + 10^((R − rⱼ)/400))
-      midRank = √(actual_rank × seed(current_rating))
-      Find R* such that seed(R*) = midRank   (binary search)
-      delta = (R* − current_rating) / 2
+    Algorithm (per Mike Mirzayanov / Carrot):
+      1. For each contestant:
+         seed(R) = 1 + Σ_{j≠i} 1/(1 + 10^((R − rⱼ)/400))
+         midRank = √(actual_rank × seed(current_rating))
+         Find R* such that seed(R*) = midRank   (binary search)
+         delta = (R* − current_rating) / 2
+      2. adjustDeltas — inflation correction:
+         a) inc = floor(-sum(all_deltas) / n) - 1;  add inc to all deltas
+         b) For top 4*sqrt(n) users (by rating), compute inc2 to make
+            their delta sum ≈ 0;  add inc2 to ALL deltas (clamped to [-10, 0])
     """
     n = len(participants)
-    user_rating = participants[user_idx]["rating"]
-    user_rank = participants[user_idx]["rank"]
+    all_ratings = [p["rating"] for p in participants]
 
-    # Precompute other ratings as a list (excluding user) for speed
-    others = [participants[j]["rating"] for j in range(n) if j != user_idx]
-
-    def get_seed(rating):
+    def get_seed_for(idx):
+        """Expected rank for participant idx."""
+        rating = all_ratings[idx]
         s = 1.0
-        for r in others:
-            s += 1.0 / (1.0 + 10.0 ** ((rating - r) / 400.0))
+        for j in range(n):
+            if j == idx:
+                continue
+            s += 1.0 / (1.0 + 10.0 ** ((rating - all_ratings[j]) / 400.0))
         return s
 
-    seed = get_seed(user_rating)
-    mid_rank = math.sqrt(user_rank * seed)
+    def find_r_star(idx):
+        """Binary search for R* where seed(R*) = midRank for participant idx."""
+        rating = all_ratings[idx]
+        rank = participants[idx]["rank"]
+        seed = get_seed_for(idx)
+        mid_rank = math.sqrt(rank * seed)
 
-    # Binary search for R* where get_seed(R*) ≈ midRank
-    lo, hi = 1, 8000
-    while hi - lo > 1:
-        mid = (lo + hi) // 2
-        if get_seed(mid) < mid_rank:
-            hi = mid
-        else:
-            lo = mid
+        lo, hi = 1, 8000
+        while hi - lo > 1:
+            mid_val = (lo + hi) // 2
+            # Compute seed at mid_val, excluding self
+            s = 1.0
+            for j in range(n):
+                if j == idx:
+                    continue
+                s += 1.0 / (1.0 + 10.0 ** ((mid_val - all_ratings[j]) / 400.0))
+            if s < mid_rank:
+                hi = mid_val
+            else:
+                lo = mid_val
+        return lo
 
-    R_star = lo
-    delta = (R_star - user_rating) // 2
-    predicted = user_rating + delta
+    # Step 1: Compute raw deltas for ALL participants
+    deltas = []
+    for i in range(n):
+        r_star = find_r_star(i)
+        delta = math.trunc((r_star - all_ratings[i]) / 2)
+        deltas.append(delta)
+
+    # Step 2a: Global inflation correction
+    delta_sum = sum(deltas)
+    inc = math.trunc(-delta_sum / n) - 1  # Math.trunc(-sum/n) - 1, matching Carrot
+    for i in range(n):
+        deltas[i] += inc
+
+    # Step 2b: Top-user zero-sum correction
+    # Sort indices by rating descending
+    sorted_indices = sorted(range(n), key=lambda i: all_ratings[i], reverse=True)
+    zero_sum_count = min(4 * round(math.sqrt(n)), n)
+    top_delta_sum = sum(deltas[sorted_indices[i]] for i in range(zero_sum_count))
+    inc2 = min(max(math.trunc(-top_delta_sum / zero_sum_count), -10), 0)
+    for i in range(n):
+        deltas[i] += inc2
+
+    # Extract user's adjusted delta
+    user_delta = deltas[user_idx]
+    user_rating = all_ratings[user_idx]
+    predicted = user_rating + user_delta
 
     return {
         "old_rating": user_rating,
         "predicted_rating": predicted,
-        "predicted_change": delta,
-        "rank": user_rank,
+        "predicted_change": user_delta,
+        "rank": participants[user_idx]["rank"],
     }
