@@ -36,77 +36,25 @@ REST_HEADERS = {
     "Accept": "application/json",
 }
 
-# ── Cloudflare Cookie Manager (Playwright) ───────────────────────────────────
-# Uses a headless Chrome browser ONCE to get Cloudflare clearance cookies.
-# Cookies are cached and reused with httpx for fast subsequent requests.
-_cf_cookies: Dict[str, str] = {}
-_cf_cookies_ts: float = 0
-CF_COOKIE_TTL = 2 * 3600  # Refresh cookies every 2 hours
+# ── Cloudflare Bypass (cloudscraper) ──────────────────────────────────────────
+# Pure Python library that solves Cloudflare JS challenges without a browser.
+# No system deps, no root access, works everywhere including Render free tier.
+import cloudscraper
 
-async def _get_cf_cookies() -> Dict[str, str]:
-    """Get Cloudflare clearance cookies, launching Playwright if needed."""
-    global _cf_cookies, _cf_cookies_ts
-    now = time.time()
-    
-    # Return cached cookies if fresh
-    if _cf_cookies and (now - _cf_cookies_ts) < CF_COOKIE_TTL:
-        return _cf_cookies
-    
-    log = logging.getLogger("lc_predict")
-    log.info("[CF-BYPASS] Launching headless Chrome to get Cloudflare cookies...")
-    
+_scraper = cloudscraper.create_scraper(
+    browser={'browser': 'chrome', 'platform': 'linux', 'desktop': True}
+)
+
+
+async def _cf_get(url: str) -> Optional[dict]:
+    """Async wrapper for cloudscraper GET request. Returns JSON or None."""
     try:
-        from playwright.async_api import async_playwright
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage']
-            )
-            context = await browser.new_context(
-                user_agent=REST_HEADERS["User-Agent"],
-                viewport={"width": 1920, "height": 1080},
-                locale="en-US",
-            )
-            await context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-            )
-            page = await context.new_page()
-            
-            # Visit LeetCode ranking page to trigger Cloudflare
-            url = f"{LC_RANK_API}/biweekly-contest-178/?pagination=1&region=global"
-            resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            
-            # Wait for CF challenge to resolve if needed
-            title = await page.title()
-            if "Just a moment" in title or resp.status == 403:
-                log.info("[CF-BYPASS] Cloudflare challenge detected, waiting...")
-                for i in range(15):
-                    await page.wait_for_timeout(1000)
-                    title = await page.title()
-                    if "Just a moment" not in title:
-                        log.info(f"[CF-BYPASS] Challenge resolved after {i+1}s")
-                        break
-            
-            cookies = await context.cookies()
-            _cf_cookies = {c['name']: c['value'] for c in cookies}
-            _cf_cookies_ts = now
-            log.info(f"[CF-BYPASS] Got {len(_cf_cookies)} cookies: {list(_cf_cookies.keys())}")
-            
-            await browser.close()
-    except Exception as e:
-        log.error(f"[CF-BYPASS] Playwright failed: {e}")
-        # Clear old cookies on failure
-        _cf_cookies = {}
-    
-    return _cf_cookies
-
-
-def _build_rest_headers(cf_cookies: Dict[str, str]) -> dict:
-    """Build REST headers with Cloudflare cookies injected."""
-    headers = dict(REST_HEADERS)
-    if cf_cookies:
-        headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cf_cookies.items())
-    return headers
+        resp = await asyncio.to_thread(_scraper.get, url, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
 
 
 # ── Caches ───────────────────────────────────────────────────────────────────
@@ -149,12 +97,8 @@ async def get_prediction(handle: str) -> Optional[dict]:
     log = logging.getLogger("lc_predict")
     log.info(f"[LC-PREDICT] Starting prediction for {handle}")
 
-    # Get Cloudflare bypass cookies (Playwright launches Chrome once, caches for 2h)
-    cf_cookies = await _get_cf_cookies()
-    rest_headers = _build_rest_headers(cf_cookies)
-
     async with httpx.AsyncClient(
-        timeout=120, follow_redirects=True, headers=rest_headers
+        timeout=120, follow_redirects=True, headers=REST_HEADERS
     ) as client:
         # 1 ── Recent finished contests
         contests = await _find_recent_contests(client)
@@ -280,10 +224,9 @@ async def _find_user_rank_in_contest(client, contest_slug: str, handle: str) -> 
     # Get total users first
     try:
         url = f"{LC_RANK_API}/{contest_slug}/?pagination=1&region=global"
-        resp = await client.get(url)
-        if resp.status_code != 200:
+        data = await _cf_get(url)
+        if not data:
             return None
-        data = resp.json()
         total_users = data.get("user_num", 0)
         if total_users == 0:
             return None
@@ -308,9 +251,9 @@ async def _find_user_rank_in_contest(client, contest_slug: str, handle: str) -> 
             if found_rank is not None:
                 return
             try:
-                r = await client.get(f"{LC_RANK_API}/{contest_slug}/?pagination={page_num}&region=global")
-                if r.status_code == 200:
-                    for u in r.json().get("total_rank", []):
+                data = await _cf_get(f"{LC_RANK_API}/{contest_slug}/?pagination={page_num}&region=global")
+                if data:
+                    for u in data.get("total_rank", []):
                         if u["username"].lower() == handle_lower:
                             found_rank = u["rank"]
                             return
@@ -471,10 +414,9 @@ async def _fetch_sampled_standings(
     # Page 1 → total user count
     try:
         url = f"{LC_RANK_API}/{contest_slug}/?pagination=1&region=global"
-        resp = await client.get(url)
-        if resp.status_code != 200:
+        page1 = await _cf_get(url)
+        if not page1:
             return None
-        page1 = resp.json()
         total_users = page1.get("user_num", 0)
         if total_users == 0:
             return None
@@ -520,9 +462,8 @@ async def _fetch_sampled_standings(
             return
         async with sem:
             try:
-                r = await client.get(f"{LC_RANK_API}/{contest_slug}/?pagination={page_num}&region=global")
-                if r.status_code == 200:
-                    data = r.json()
+                data = await _cf_get(f"{LC_RANK_API}/{contest_slug}/?pagination={page_num}&region=global")
+                if data:
                     for u in data.get("total_rank", []):
                         all_users.append({
                             "handle": u["username"],
