@@ -33,6 +33,28 @@ async def predict_lc(handle: str):
     return {"prediction": result}
 
 
+@router.get("/debug/lc-proxy")
+async def debug_lc_proxy():
+    import cloudscraper
+    import asyncio
+    scraper = cloudscraper.create_scraper(
+        browser={'browser': 'chrome', 'platform': 'linux', 'desktop': True}
+    )
+    url = "https://leetcode.com/contest/api/ranking/biweekly-contest-178/?pagination=1&region=global"
+
+    def fetch():
+        return scraper.get(url, timeout=30)
+
+    try:
+        resp = await asyncio.to_thread(fetch)
+        return {
+            "status_code": resp.status_code,
+            "body_preview": resp.text[:1000]
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @router.get("/debug")
 async def predict_debug():
     """Diagnostic: test LC API connectivity from this server."""
