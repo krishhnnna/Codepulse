@@ -7,7 +7,12 @@ set -e
 echo "=== Installing Python dependencies ==="
 pip install -r requirements.txt
 
-echo "=== Installing Playwright Chromium ==="
-playwright install --with-deps chromium
+echo "=== Installing Playwright system deps ==="
+# Install Playwright browsers + system dependencies
+# On Render (Ubuntu), --with-deps installs libgbm, libnss3, etc.
+PLAYWRIGHT_BROWSERS_PATH=/opt/render/.cache/ms-playwright playwright install --with-deps chromium || {
+    echo "=== --with-deps failed, trying without ==="
+    PLAYWRIGHT_BROWSERS_PATH=/opt/render/.cache/ms-playwright playwright install chromium
+}
 
 echo "=== Build complete ==="
