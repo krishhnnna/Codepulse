@@ -68,7 +68,7 @@ CACHE_TTL = 6 * 3600  # 6 hours
 SAMPLE_PAGES = 60       # ~1500 users evenly spread across ALL ranks
 RATING_BATCH = 60       # Users per GraphQL aliased request
 CONCURRENCY = 12        # Max parallel requests
-PREDICTION_WINDOW = 6   # Hours after contest end to show prediction
+PREDICTION_WINDOW = 48  # Hours after contest end to show prediction
 
 
 def _delta_coefficient(k: int) -> float:
