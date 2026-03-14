@@ -151,7 +151,8 @@ async def _build_prediction(client, cid, contest_name, handle, user_rank):
 async def _fetch_standings_with_ratings(client, cid):
     """
     Fetch full official standings, then batch-fetch current ratings via
-    user.info.  Returns list of {handle, rank, rating}.
+    user.info.  Returns list of {handle, rank, rating, points, penalty}.
+    Ranks are reassigned from points/penalty to match Carrot's algorithm.
     """
     try:
         resp = await client.get(
@@ -178,11 +179,20 @@ async def _fetch_standings_with_ratings(client, cid):
         if not members:
             continue
         h = members[0]["handle"]
-        participants.append({"handle": h, "rank": row["rank"], "rating": 1400})
+        participants.append({
+            "handle": h,
+            "rank": row["rank"],
+            "rating": 1400,
+            "points": row.get("points", 0),
+            "penalty": row.get("penalty", 0),
+        })
         handles_list.append(h)
 
     if not participants:
         return None
+
+    # Reassign ranks from points/penalty (matches Carrot's reassignRanks)
+    _reassign_ranks(participants)
 
     # Batch-fetch ratings (500 handles per request)
     BATCH = 500
@@ -201,13 +211,31 @@ async def _fetch_standings_with_ratings(client, cid):
                         if p["handle"] in rmap:
                             p["rating"] = rmap[p["handle"]]
         except Exception:
-            pass  # keep default 1500 for failed batches
+            pass  # keep default 1400 for failed batches
 
         # Rate-limit courtesy
         if i + BATCH < len(handles_list):
             await asyncio.sleep(0.3)
 
     return participants
+
+
+def _reassign_ranks(participants):
+    """
+    Sort participants by points (desc) then penalty (asc) and assign
+    tied ranks, matching Carrot's reassignRanks() exactly.
+    """
+    participants.sort(key=lambda p: (-p["points"], p["penalty"]))
+    last_points = None
+    last_penalty = None
+    rank = 0
+    for i in range(len(participants) - 1, -1, -1):
+        p = participants[i]
+        if p["points"] != last_points or p["penalty"] != last_penalty:
+            last_points = p["points"]
+            last_penalty = p["penalty"]
+            rank = i + 1
+        p["rank"] = rank
 
 
 def _elo_predict(participants, user_idx):
