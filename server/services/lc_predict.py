@@ -14,11 +14,12 @@ Flow:
 Caches standings + ratings per contest so repeated queries are instant.
 """
 
+import httpx
 import asyncio
-from curl_cffi import requests
 import math
 import time
 import json
+import os
 from typing import Optional, Dict, List, Tuple
 
 LC_GQL = "https://leetcode.com/graphql"
@@ -33,6 +34,20 @@ REST_HEADERS = {
     "Referer": "https://leetcode.com",
     "Accept": "application/json",
 }
+
+# ── Vercel Proxy ─────────────────────────────────────────────────────────────
+# When deployed on Render, LeetCode's Cloudflare blocks REST API calls.
+# Set LC_PROXY_URL to your Vercel frontend URL to route REST calls through
+# a Vercel serverless function proxy (e.g. https://your-app.vercel.app)
+LC_PROXY_URL = os.environ.get("LC_PROXY_URL", "").rstrip("/")
+
+
+def _ranking_url(slug: str, page: int) -> str:
+    """Build the ranking API URL, routing through Vercel proxy if configured."""
+    if LC_PROXY_URL:
+        return f"{LC_PROXY_URL}/api/lc-proxy?slug={slug}&page={page}"
+    return f"{LC_RANK_API}/{slug}/?pagination={page}&region=global"
+
 
 # ── Caches ───────────────────────────────────────────────────────────────────
 # {contest_slug: {participants: [...], total_users: int, _ts: float}}
@@ -75,7 +90,9 @@ async def get_prediction(handle: str) -> Optional[dict]:
     log = logging.getLogger("lc_predict")
     log.info(f"[LC-PREDICT] Starting prediction for {handle}")
 
-    async with requests.AsyncSession(impersonate="chrome120", timeout=120) as client:
+    async with httpx.AsyncClient(
+        timeout=120, follow_redirects=True, headers=REST_HEADERS
+    ) as client:
         # 1 ── Recent finished contests
         contests = await _find_recent_contests(client)
         if not contests:
@@ -199,10 +216,8 @@ async def _find_user_rank_in_contest(client, contest_slug: str, handle: str) -> 
     """
     # Get total users first
     try:
-        resp = await client.get(
-            f"{LC_RANK_API}/{contest_slug}/",
-            params={"pagination": 1, "region": "global"},
-        )
+        url = _ranking_url(contest_slug, 1)
+        resp = await client.get(url)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -230,10 +245,7 @@ async def _find_user_rank_in_contest(client, contest_slug: str, handle: str) -> 
             if found_rank is not None:
                 return
             try:
-                r = await client.get(
-                    f"{LC_RANK_API}/{contest_slug}/",
-                    params={"pagination": page_num, "region": "global"},
-                )
+                r = await client.get(_ranking_url(contest_slug, page_num))
                 if r.status_code == 200:
                     for u in r.json().get("total_rank", []):
                         if u["username"].lower() == handle_lower:
@@ -395,10 +407,8 @@ async def _fetch_sampled_standings(
     """
     # Page 1 → total user count
     try:
-        resp = await client.get(
-            f"{LC_RANK_API}/{contest_slug}/",
-            params={"pagination": 1, "region": "global"},
-        )
+        url = _ranking_url(contest_slug, 1)
+        resp = await client.get(url)
         if resp.status_code != 200:
             return None
         page1 = resp.json()
@@ -447,10 +457,7 @@ async def _fetch_sampled_standings(
             return
         async with sem:
             try:
-                r = await client.get(
-                    f"{LC_RANK_API}/{contest_slug}/",
-                    params={"pagination": page_num, "region": "global"},
-                )
+                r = await client.get(_ranking_url(contest_slug, page_num))
                 if r.status_code == 200:
                     data = r.json()
                     for u in data.get("total_rank", []):
