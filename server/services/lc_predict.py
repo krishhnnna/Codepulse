@@ -20,6 +20,7 @@ import math
 import time
 import json
 import os
+import logging
 from typing import Optional, Dict, List, Tuple
 
 LC_GQL = "https://leetcode.com/graphql"
@@ -27,26 +28,85 @@ LC_RANK_API = "https://leetcode.com/contest/api/ranking"
 GQL_HEADERS = {
     "Content-Type": "application/json",
     "Referer": "https://leetcode.com",
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
 REST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Referer": "https://leetcode.com",
     "Accept": "application/json",
 }
 
-# ── Vercel Proxy ─────────────────────────────────────────────────────────────
-# When deployed on Render, LeetCode's Cloudflare blocks REST API calls.
-# Set LC_PROXY_URL to your Vercel frontend URL to route REST calls through
-# a Vercel serverless function proxy (e.g. https://your-app.vercel.app)
-LC_PROXY_URL = os.environ.get("LC_PROXY_URL", "").rstrip("/")
+# ── Cloudflare Cookie Manager (Playwright) ───────────────────────────────────
+# Uses a headless Chrome browser ONCE to get Cloudflare clearance cookies.
+# Cookies are cached and reused with httpx for fast subsequent requests.
+_cf_cookies: Dict[str, str] = {}
+_cf_cookies_ts: float = 0
+CF_COOKIE_TTL = 2 * 3600  # Refresh cookies every 2 hours
+
+async def _get_cf_cookies() -> Dict[str, str]:
+    """Get Cloudflare clearance cookies, launching Playwright if needed."""
+    global _cf_cookies, _cf_cookies_ts
+    now = time.time()
+    
+    # Return cached cookies if fresh
+    if _cf_cookies and (now - _cf_cookies_ts) < CF_COOKIE_TTL:
+        return _cf_cookies
+    
+    log = logging.getLogger("lc_predict")
+    log.info("[CF-BYPASS] Launching headless Chrome to get Cloudflare cookies...")
+    
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
+            )
+            context = await browser.new_context(
+                user_agent=REST_HEADERS["User-Agent"],
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+            )
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+            )
+            page = await context.new_page()
+            
+            # Visit LeetCode ranking page to trigger Cloudflare
+            url = f"{LC_RANK_API}/biweekly-contest-178/?pagination=1&region=global"
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            
+            # Wait for CF challenge to resolve if needed
+            title = await page.title()
+            if "Just a moment" in title or resp.status == 403:
+                log.info("[CF-BYPASS] Cloudflare challenge detected, waiting...")
+                for i in range(15):
+                    await page.wait_for_timeout(1000)
+                    title = await page.title()
+                    if "Just a moment" not in title:
+                        log.info(f"[CF-BYPASS] Challenge resolved after {i+1}s")
+                        break
+            
+            cookies = await context.cookies()
+            _cf_cookies = {c['name']: c['value'] for c in cookies}
+            _cf_cookies_ts = now
+            log.info(f"[CF-BYPASS] Got {len(_cf_cookies)} cookies: {list(_cf_cookies.keys())}")
+            
+            await browser.close()
+    except Exception as e:
+        log.error(f"[CF-BYPASS] Playwright failed: {e}")
+        # Clear old cookies on failure
+        _cf_cookies = {}
+    
+    return _cf_cookies
 
 
-def _ranking_url(slug: str, page: int) -> str:
-    """Build the ranking API URL, routing through Vercel proxy if configured."""
-    if LC_PROXY_URL:
-        return f"{LC_PROXY_URL}/api/lc-proxy?slug={slug}&page={page}"
-    return f"{LC_RANK_API}/{slug}/?pagination={page}&region=global"
+def _build_rest_headers(cf_cookies: Dict[str, str]) -> dict:
+    """Build REST headers with Cloudflare cookies injected."""
+    headers = dict(REST_HEADERS)
+    if cf_cookies:
+        headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cf_cookies.items())
+    return headers
 
 
 # ── Caches ───────────────────────────────────────────────────────────────────
@@ -86,12 +146,15 @@ async def get_prediction(handle: str) -> Optional[dict]:
     where the user participated but official ratings haven't dropped yet.
     Returns None if no prediction available.
     """
-    import logging
     log = logging.getLogger("lc_predict")
     log.info(f"[LC-PREDICT] Starting prediction for {handle}")
 
+    # Get Cloudflare bypass cookies (Playwright launches Chrome once, caches for 2h)
+    cf_cookies = await _get_cf_cookies()
+    rest_headers = _build_rest_headers(cf_cookies)
+
     async with httpx.AsyncClient(
-        timeout=120, follow_redirects=True, headers=REST_HEADERS
+        timeout=120, follow_redirects=True, headers=rest_headers
     ) as client:
         # 1 ── Recent finished contests
         contests = await _find_recent_contests(client)
@@ -216,7 +279,7 @@ async def _find_user_rank_in_contest(client, contest_slug: str, handle: str) -> 
     """
     # Get total users first
     try:
-        url = _ranking_url(contest_slug, 1)
+        url = f"{LC_RANK_API}/{contest_slug}/?pagination=1&region=global"
         resp = await client.get(url)
         if resp.status_code != 200:
             return None
@@ -245,7 +308,7 @@ async def _find_user_rank_in_contest(client, contest_slug: str, handle: str) -> 
             if found_rank is not None:
                 return
             try:
-                r = await client.get(_ranking_url(contest_slug, page_num))
+                r = await client.get(f"{LC_RANK_API}/{contest_slug}/?pagination={page_num}&region=global")
                 if r.status_code == 200:
                     for u in r.json().get("total_rank", []):
                         if u["username"].lower() == handle_lower:
@@ -407,7 +470,7 @@ async def _fetch_sampled_standings(
     """
     # Page 1 → total user count
     try:
-        url = _ranking_url(contest_slug, 1)
+        url = f"{LC_RANK_API}/{contest_slug}/?pagination=1&region=global"
         resp = await client.get(url)
         if resp.status_code != 200:
             return None
@@ -457,7 +520,7 @@ async def _fetch_sampled_standings(
             return
         async with sem:
             try:
-                r = await client.get(_ranking_url(contest_slug, page_num))
+                r = await client.get(f"{LC_RANK_API}/{contest_slug}/?pagination={page_num}&region=global")
                 if r.status_code == 200:
                     data = r.json()
                     for u in data.get("total_rank", []):
